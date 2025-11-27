@@ -1,11 +1,15 @@
+# Synthetic velocity stepping experiment as initial test of RSF state evolution and yield strength calculation
+#
 using Plots
 
+# simpler version of function using only one analytical solution for state update
 function calcyield(a, b, L, mu0, V0, Vp, dt, oldstate, P, lambda=0, cohesion=0)
     newstate = log(V0 / Vp + (exp(oldstate) - V0 / Vp) * exp(-Vp * dt / L))
     mud = a * asinh(Vp / (2 * V0) * exp((mu0 + b * newstate) / a))
     syield = P * (1 - lambda) * mud + cohesion
     return newstate, mud, syield
 end
+# actual version with case seperation for simpler anyltical solution for low Vp
 function calcyield2(a, b, L, mu0, V0, Vp, dt, oldstate, P, lambda=0, cohesion=0)
     if (Vp * dt / L <= 1e-6)
         newstate = log(exp(oldstate) * (1 - Vp * dt / L) + V0 * dt / L)
@@ -31,12 +35,12 @@ for i = 1:100
     phi[i+1], mud[i+1], syield[i+1] = calcyield2(0.011, 0.015, 0.09, 0.5, 2e-11, 2e-11, 5e8, phi[i], 50e6)
 end
 slip[2:100] = slip[1].+2e-11*5e8*1:99
-
+# velocity step
 for i = 101:2000
     phi[i+1], mud[i+1], syield[i+1] = calcyield2(0.011, 0.015, 0.09, 0.5, 2e-11, 1, 1e-2, phi[i], 50e6)
 end
 slip[101:2000] = slip[100] .+ 1 * 1e-2 * (1:1900)
-
+# arrest
 for i = 2001:3000
     phi[i+1], mud[i+1], syield[i+1] = calcyield2(0.011, 0.015, 0.09, 0.5, 2e-11, 1e-10, 1e7, phi[i], 50e6)
 end

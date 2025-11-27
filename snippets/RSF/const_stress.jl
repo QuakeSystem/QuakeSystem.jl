@@ -1,4 +1,5 @@
-#force slip by applying constant stress
+#force slip by applying constant stress (fun expontential growth!)
+using Plots
 include("calcyield_rsf.jl")
 include("calcvpvisc.jl")
 include("calc_sliprate_after.jl")
@@ -19,24 +20,46 @@ cohesion = 0
 
 # variables
 #Vp = 1e-8
-dt = 1
-oldstate = 1
 P = 50e6
 etav = 1e24
 
 # constant stress
 tauii = 26e6
 
-# initial velocity
+# initial velocity and state
 Vp = V0
+state = 1
 
-for i = 1:10000
+# time step duration
+dt = 100000
+
+function timestep(oldstate, Vp)
     newstate, mud, syield = calcyield(a, b, L, mu0, V0, Vp, dt, oldstate, P, lambda, cohesion)
     etavp = calcvpvisc(syield, Vp, etav, dx, dy)
     # NAVIER STOKES WOULD BE SOLVED HERE
     #println(etavp)
 
     Vp = calc_sliprate_RSF(a, b, mu0, V0, newstate, P, tauii, lambda, cohesion)
-    # continute to next step
-    oldstate = newstate
+    return newstate, mud, Vp
 end
+
+# time step count
+niter = 25500
+
+
+# initialize arrays
+Vps = zeros(niter)
+states = zeros(niter)
+muds = zeros(niter)
+
+for i = 1:niter
+    global state, Vp
+    state, mud, Vp = timestep(state, Vp)
+    Vps[i] = Vp
+    states[i] = state
+    muds[i] = mud
+end
+
+plot(states)
+plot(Vps)
+plot(muds[2:end])
