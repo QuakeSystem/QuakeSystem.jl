@@ -12,9 +12,9 @@ dy = 500
 # material parameters
 a = 0.011 # rate parameter
 b = 0.015 # state paramter
-L = 0.09 # characteristic slip distance [m]
+L = 0.01 # characteristic slip distance [m]
 mu0 = 0.5 # reference friction
-V0 = 2e-11 # reference slip rate [m/s]
+V0 = 4e-9 # reference slip rate [m/s]
 lambda = 0 # fluid pressure ratio
 cohesion = 0 # cohesion [Pa]
 poisson = 0.25 # poisson ratio
@@ -29,12 +29,12 @@ vy = 0
 # stressing rate in 0D
 # simplified hookes law: stress rate = 2*G*strainrate
 # strainrate = sliprate/(2*dx)
-platerate = 1e-9
+platerate = 4e-9
 stressrate = 2 * G * platerate / (2 * dx)
 
 # initial velocity and state
 Vp = V0
-state = 1
+state = 0
 # initial viscoplastic viscosity
 etavp = etav
 # initial stress
@@ -56,7 +56,7 @@ function timestep(oldstate, Vp, etavp, tau)
 end
 
 # time step count
-niter = 1000
+niter = 1500
 
 # initialize arrays
 Vps = zeros(niter)
@@ -77,12 +77,16 @@ end
 
 times = cumsum(dts)
 
+# interface strength
+istrength = P .* (mu0 .+ b * states)
+
 #plot(times, states)
-p = plot(times / 3600 / 24 / 365.25, Vps, yscale=:log10)
+p = plot(times[500:end] / 3600 / 24 / 365.25, Vps[500:end], yscale=:log10)
 xlabel!("Time in years")
 ylabel!("Vp in m/s")
 display(p)
-p = plot(times / 3600 / 24 / 365.25, taus / 1e6)
+p = plot(times[500:end] / 3600 / 24 / 365.25, taus[500:end] / 1e6, label="stress")
+#p = plot!(times[500:end]  / 3600 / 24 / 365.25, istrength[500:end]/1e6,label="interface strength")
 xlabel!("Time in years")
 ylabel!("stress in MPa")
 display(p)
