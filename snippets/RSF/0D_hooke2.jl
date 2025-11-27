@@ -9,10 +9,10 @@ include("calc_dt.jl")
 dx = 500
 dy = 500
 
-# material parameters
+# material parameters (has to be very specific or it decays/explodes, no adequate hinderance to extreme slip rates (add qd or inertia?))
 a = 0.011 # rate parameter
 b = 0.015 # state paramter
-L = 0.0045 # characteristic slip distance [m]
+L = 0.0047 # characteristic slip distance [m]
 mu0 = 0.5 # reference friction
 V0 = 4e-9 # reference slip rate [m/s]
 lambda = 0 # fluid pressure ratio
