@@ -31,15 +31,25 @@ begin
         dtw = thetamax * L / Vp
         return dtw
     end
-    # healing time step
-    function calc_dth(thetamax)
-        dth = 0.2 * thetamax
+    # healing time step (how does this align with what's in the paper?)
+    function calc_dth(V0, L, state)
+        phisc = V0 / L * exp(-state)
+        dth = 0.2 * 1.0 / phisc
         return dth
     end
 
     # viscoelastic relaxation time
-    function calc_dvep(etavp, G, fmax=0.2)
+    function calc_dtvep(etavp, G, fmax=0.2)
         dvep = fmax * etavp / G
         return dvep
+    end
+    function calc_dt(P, lambda, G, etavp, L, V0, poisson, dx, dy, vx, vy, Vp, state)
+        dtd = calc_dtd(vx, dx, vy, dy)
+        thetamax = max_state_change(P, lambda, G, poisson, dx, dy)
+        dth = calc_dth(V0, L, state)
+        dtw = calc_dtw(thetamax, L, Vp)
+        dtvep = calc_dtvep(etavp, G)
+        dt = min(dtd, dth, dtw, dtvep)
+        return dt
     end
 end
