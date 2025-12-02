@@ -46,5 +46,11 @@ for i = 2001:3000
 end
 slip[2001:3000] = slip[2000] .+ 2e-11 * 1e7 * (1:1000)
 
-Plots.plot(slip[2:3000], mud[2:3000])
-Plots.plot(slip[2:3000], phi[2:3000])
+p = Plots.plot(slip[2:3000], mud[2:3000])
+xlabel!("Slip in m")
+ylabel!("μ")
+display(p)
+p = Plots.plot(slip[2:3000], phi[2:3000])
+xlabel!("Slip in m")
+ylabel!("Ω")
+display(p)
