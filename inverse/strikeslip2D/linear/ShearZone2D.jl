@@ -1,3 +1,6 @@
+# make sure we use the local environment
+using Pkg; Pkg.activate(@__DIR__)
+
 const isCUDA = false
 
 @static if isCUDA
