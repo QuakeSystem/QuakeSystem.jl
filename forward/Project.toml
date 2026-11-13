@@ -1,0 +1,5 @@
+[deps]
+JustRelax = "34418575-392d-4e26-8c6d-96b0910afa06"
+
+[sources]
+JustRelax = {url = "https://github.com/QuakeSystem/JustRelax.jl", rev = "v0.8.1-QS"}
