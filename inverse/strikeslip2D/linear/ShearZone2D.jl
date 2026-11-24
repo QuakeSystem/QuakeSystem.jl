@@ -335,6 +335,122 @@ function run_time_loop!(model, igg)
     return history
 end
 
+## OPTIMIZER --------------------------------------------------------------------------
+
+# G varies, the time step does not (see problem 1 below)
+setup_ref = setup_linear(; plot_every = nothing, verbose = 1, run_adjoint = false)
+setup_G(G) = merge(
+    setup_linear(; G, plot_every = nothing, verbose = 1, run_adjoint = false),
+    (; time = setup_ref.time),
+)
+
+# Forward run without adjoint: final Vx and the box mask (true at the 144 observation nodes)
+function forward_Vx(setup, igg)
+    configure_output!(setup.output)
+    model = build_model(setup)
+    run_time_loop!(model, igg)
+    (; center, half_width) = setup.adjoint
+    box = box_observation(model.stokes.V.Vx, model.grid, center, half_width; antisymmetric = false)
+    return Array(model.stokes.V.Vx), Array(box.weights) .!= 0
+end
+
+misfit(Vx, Vx_obs, mask) = 0.5 * sum(abs, mask .* (Vx .- Vx_obs))
+
+# d misfit / dG: run again with the adjoint, its weights set to the residual
+function misfit_gradient_G(setup, igg, Vx, Vx_obs, mask)
+    s = merge(setup, (; adjoint = merge(setup.adjoint, (; run = true))))
+    configure_output!(s.output)
+    model = build_model(s)
+    model.observation.weights .= mask .* (Vx .- Vx_obs)
+    h = last(run_time_loop!(model, igg))
+    dmdG, dmdKb = (sum(r.dJdp for r in h.totals if r.name === n) for n in (:G, :Kb))
+    return nu_sensitivities(dmdG, dmdKb, s.material.G, s.material.ν).G_ν
+end
+
+function gradient_descent_G(igg; G0, Vx_obs, gd_maxiter = 300, maxls = 10, max_dlnG = 0.5,
+                            tol_m = 1e-6,   # stop when m/m0 < tol_m (fit good enough)
+                            tol_G = 1e-4,   # stop when an accepted step changes G by < 0.01 %
+                            rtol  = 1e-3)   # stop when m improves by < 0.1 % (stall)
+
+    G = G0
+    gamma = nothing
+
+    @printf("Calc Vx for G = %.3e ...", G)
+    Vx, mask = forward_Vx(setup_G(G), igg)
+    @printf("... done calculating Vx for G = %.3e \n", G)
+
+    @printf("calculating misfit between Vx and Vx_obs ...")
+    m = misfit(Vx, Vx_obs, mask)
+    @printf("... done! The misfit is %.3e \n", m)
+
+    m0 = m
+    history_opt = [(; iter = 0, G, m = m0)]
+    status = :maxiter                                   # records why the loop ended
+
+    println("\nXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX")
+    println("XXXXXXXXXXXX   start gradient descent loop   XXXXXXXXXXXX")
+    println("XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX\n")
+
+    for i in 1:gd_maxiter
+        @printf("i = %d, G = %.3e \n", i, G)
+        dmdG = misfit_gradient_G(setup_G(G), igg, Vx, Vx_obs, mask)
+        s = G * dmdG / m                                # d ln m / d ln G
+        gamma = something(gamma, 0.1 / abs(s))
+        @printf("Calculated dmdG: %.3e \n", dmdG)
+        m_prev = m
+        G_prev = G                                      
+        accepted = false
+
+        for ls_i in 1:maxls
+            @printf("backtrack iteration %d \n", ls_i)
+            dlnG = clamp(-gamma * s, -max_dlnG, max_dlnG)
+            G_try = G * exp(dlnG)
+            Vx_try, _ = forward_Vx(setup_G(G_try), igg)
+            m_try = misfit(Vx_try, Vx_obs, mask)
+            @printf("m_try misfit: %.6e \n", m_try)
+
+            if m_try < m                               
+                G, Vx, m = G_try, Vx_try, m_try
+                gamma *= 1.2
+                accepted = true
+                break
+            end
+            gamma *= 0.5
+        end
+        push!(history_opt, (; iter = i, G, m))
+
+        if !accepted
+            @printf("Line search failed at iteration %d\n", i)
+            status = :linesearch_failed
+            break
+        end
+
+        dlnG_acc = log(G / G_prev)                      
+        @printf("Iteration %3d: misfit = %.4e (m/m0 = %.3e), G = %.4e Pa (%+.3f %%)\n",
+                i, m, m / m0, G, 100 * (G / G_prev - 1))
+
+        # stopping criteria. the first one met ends the loop
+        if m / m0 < tol_m
+            @printf("Converged: m/m0 = %.3e < tol_m = %.1e\n", m / m0, tol_m)
+            status = :converged_misfit
+            break
+        elseif abs(dlnG_acc) < tol_G
+            @printf("Converged: G changed by %.4f %% in the last step (< %.4f %%)\n",
+                    100 * abs(dlnG_acc), 100 * tol_G)
+            status = :converged_G
+            break
+        elseif abs(m_prev - m) <= rtol * m_prev
+            @printf("Stalled: misfit decreased by only %.3e %% in the last step\n",
+                    100 * (m_prev - m) / m_prev)
+            status = :stalled
+            break
+        end
+    end
+
+    status === :maxiter && @printf("Reached gd_maxiter = %d without meeting a stopping criterion\n", gd_maxiter)
+    return (; G, misfit = m, status, history = history_opt)
+end
+
 ## MAIN -------------------------------------------------------------------------------
 function main(setup, igg)
     configure_output!(setup.output)
@@ -351,12 +467,16 @@ end
 ## END OF MAIN ------------------------------------------------------------------------
 
 # Run ---------------------------------------------------------------------------------
-setup = setup_linear()
 
+setup = setup_linear()
 if ImplicitGlobalGrid.grid_is_initialized()
     finalize_global_grid(; finalize_MPI = false)
 end
 igg = IGG(init_global_grid(setup.domain.nx, setup.domain.ny, 1; init_MPI = !JustRelax.MPI.Initialized())...)
 
-result = main(setup, igg)
+Vx_obs, _ = forward_Vx(setup_G(65.0e9), igg)
+
+result = gradient_descent_G(igg; G0 = 50.0e9, Vx_obs, rtol = 1.0e-1)
+
+
 nothing   # to keep `result` quiet / to not print result
