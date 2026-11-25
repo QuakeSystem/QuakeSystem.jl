@@ -354,7 +354,7 @@ function forward_Vx(setup, igg)
     return Array(model.stokes.V.Vx), Array(box.weights) .!= 0
 end
 
-misfit(Vx, Vx_obs, mask) = 0.5 * sum(abs, mask .* (Vx .- Vx_obs))
+misfit(Vx, Vx_obs, mask) = 0.5 * sum(abs2, mask .* (Vx .- Vx_obs))
 
 # d misfit / dG: run again with the adjoint, its weights set to the residual
 function misfit_gradient_G(setup, igg, Vx, Vx_obs, mask)
@@ -384,7 +384,7 @@ function gradient_descent_G(igg; G0, Vx_obs, gd_maxiter = 300, maxls = 10, max_d
     @printf("... done! The misfit is %.3e \n", m)
 
     m0 = m
-    history_opt = [(; iter = 0, G, m = m0)]
+    history_opt = [(; gd_iter = 0, bt_iter = 0, G, m = m0, dmdG = NaN, accepted = false)]
     status = :maxiter                                   # records why the loop ended
 
     println("\nXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX")
@@ -413,11 +413,12 @@ function gradient_descent_G(igg; G0, Vx_obs, gd_maxiter = 300, maxls = 10, max_d
                 G, Vx, m = G_try, Vx_try, m_try
                 gamma *= 1.2
                 accepted = true
+                push!(history_opt, (; gd_iter = i, bt_iter = ls_i, G = G_try, m = m_try, dmdG = dmdG, accepted = accepted))
                 break
             end
+            push!(history_opt, (; gd_iter = i, bt_iter = ls_i, G = G_try, m = m_try, dmdG = dmdG, accepted = accepted))
             gamma *= 0.5
         end
-        push!(history_opt, (; iter = i, G, m))
 
         if !accepted
             @printf("Line search failed at iteration %d\n", i)
@@ -476,7 +477,9 @@ igg = IGG(init_global_grid(setup.domain.nx, setup.domain.ny, 1; init_MPI = !Just
 
 Vx_obs, _ = forward_Vx(setup_G(65.0e9), igg)
 
-result = gradient_descent_G(igg; G0 = 50.0e9, Vx_obs, rtol = 1.0e-1)
+result = gradient_descent_G(igg; G0 = 50.0e9, Vx_obs)
 
+plot_gradient_descent_G(result; G_true = 65.0e9, figdir = setup.output.figdir)
+plot_gradient_descent_G(result; G_true = 65.0e9, figdir = setup.output.figdir, yscale = log)
 
 nothing   # to keep `result` quiet / to not print result

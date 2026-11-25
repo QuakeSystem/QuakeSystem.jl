@@ -294,3 +294,75 @@ function plot_sensitivities_combined(stokes_ad,gradients,grid,logarithmic,coords
     save_figure(figdir,"sensitivity_combined"*step_tag(step),fig)
     return fig
 end
+
+## Gradient descent diagnostics ---------------------------------------------------------
+"""
+    plot_gradient_descent_G(result; G_true=nothing, figdir=nothing, name="gradient_descent_G")
+
+Misfit-over-G plot of `gradient_descent_G`, built from `result.history`.
+- Solid line + filled markers: the accepted path (start point and every accepted step).
+- Faint dashed segments + hollow markers: rejected backtracking trials, each drawn from the
+  accepted point it was tried from.
+`G_true` (optional) adds a vertical line at the synthetic-truth G. If `figdir` is given the
+figure is saved there.
+"""
+function plot_gradient_descent_G(result; G_true=nothing, figdir=nothing, name="gradient_descent_G", yscale=identity)
+    h = result.history
+    # the start point (gd_iter = 0) carries accepted = false but belongs to the accepted path
+    is_acc = [e.accepted || e.gd_iter == 0 for e in h]
+    path   = h[is_acc]
+    trials = h[.!is_acc]
+
+    # base point of every rejected trial: the last accepted point before it
+    base = Vector{eltype(h)}(undef, length(trials))
+    last_acc = first(h); k = 0
+    for (e, a) in zip(h, is_acc)
+        a ? (last_acc = e) : (k += 1; base[k] = last_acc)
+    end
+
+    fig = Figure(size=(1250,650),fontsize=20)
+    ax = Axis(fig[1,1];xlabel="G [GPa]",ylabel="misfit",yscale=yscale,
+              title="Gradient descent on G ($(length(path)-1) accepted, $(length(trials)) rejected)")
+
+    c_acc, c_rej = :dodgerblue3, :darkorange2
+
+    for (b, e) in zip(base, trials)       # rejected trial segments, from where they were tried
+        lines!(ax,[b.G,e.G] ./ 1e9,[b.m,e.m];color=(c_rej,0.35),linestyle=:dash,linewidth=1.5)
+    end
+    scatter!(ax,[e.G for e in trials] ./ 1e9,[e.m for e in trials];color=(c_rej,0.15),
+             strokecolor=(c_rej,0.6),strokewidth=1.5,markersize=12,
+             label="rejected trial (m ≥ current m)")
+
+    lines!(ax,[e.G for e in path] ./ 1e9,[e.m for e in path];color=c_acc,linewidth=2.5)
+    scatter!(ax,[e.G for e in path] ./ 1e9,[e.m for e in path];color=c_acc,markersize=12,
+             label="accepted")
+    # local misfit slope at every accepted point: a short black tangent segment. The gradient at a
+    # point is computed when the next iteration starts from it, so it sits in the history entries
+    # of iteration gd_iter+1 (the final point has none).
+    xs, ys = [e.G for e in path] ./ 1e9, [e.m for e in path]
+    xspan = max(maximum(xs) - minimum(xs), eps())
+    yspan = max(maximum(ys) - minimum(ys), eps())
+    first_grad = false
+    for e in path
+        j = findfirst(t -> t.gd_iter == e.gd_iter + 1, h)
+        isnothing(j) && continue
+        slope = h[j].dmdG * 1e9                       # dm/dG per GPa, matching the x axis
+        # half-width: 4 % of the G range, shortened so the segment never exceeds 8 % of the misfit
+        # range (or 30 % of the point's own misfit, which keeps it positive on a log axis)
+        dx = min(0.04 * xspan, slope == 0 ? Inf : min(0.08 * yspan, 0.3 * e.m) / abs(slope))
+        lines!(ax,[e.G/1e9 - dx, e.G/1e9 + dx],[e.m - slope*dx, e.m + slope*dx];color=:black,linewidth=3,
+               label = first_grad ? nothing : "gradient dm/dG")
+        first_grad = true
+    end
+
+    scatter!(ax,[first(path).G] ./ 1e9,[first(path).m];color=:black,marker=:diamond,markersize=16,
+             label="start (G₀)")
+    scatter!(ax,[last(path).G] ./ 1e9,[last(path).m];color=:red,marker=:star5,markersize=20,
+             label="final ($(get(result,:status,"")))")
+
+    isnothing(G_true) || vlines!(ax,G_true/1e9;color=:gray40,linestyle=:dot,linewidth=2,label="G true")
+
+    Legend(fig[1,2],ax;framevisible=false)
+    isnothing(figdir) || save_figure(figdir,"$(name)_$(nameof(yscale))",fig)   # e.g. gradient_descent_G_log.png
+    return fig
+end
