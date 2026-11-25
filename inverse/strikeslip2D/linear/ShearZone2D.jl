@@ -384,7 +384,7 @@ function gradient_descent_G(igg; G0, Vx_obs, gd_maxiter = 300, maxls = 10, max_d
     @printf("... done! The misfit is %.3e \n", m)
 
     m0 = m
-    history_opt = [(; gd_iter = 0, bt_iter = 0, G, m = m0, dmdG = NaN, accepted = false)]
+    history_opt = [(; gd_iter = 0, bt_iter = 0, G, m = m0, dmdG = NaN, accepted = true)]
     status = :maxiter                                   # records why the loop ended
 
     println("\nXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX")

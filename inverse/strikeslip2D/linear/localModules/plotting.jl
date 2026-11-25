@@ -309,7 +309,7 @@ figure is saved there.
 function plot_gradient_descent_G(result; G_true=nothing, figdir=nothing, name="gradient_descent_G", yscale=identity)
     h = result.history
     # the start point (gd_iter = 0) carries accepted = false but belongs to the accepted path
-    is_acc = [e.accepted || e.gd_iter == 0 for e in h]
+    is_acc = [e.accepted for e in h]
     path   = h[is_acc]
     trials = h[.!is_acc]
 
@@ -331,7 +331,7 @@ function plot_gradient_descent_G(result; G_true=nothing, figdir=nothing, name="g
     end
     scatter!(ax,[e.G for e in trials] ./ 1e9,[e.m for e in trials];color=(c_rej,0.15),
              strokecolor=(c_rej,0.6),strokewidth=1.5,markersize=12,
-             label="rejected trial (m ≥ current m)")
+             label="rejected trial (m_try ≥ current m)")
 
     lines!(ax,[e.G for e in path] ./ 1e9,[e.m for e in path];color=c_acc,linewidth=2.5)
     scatter!(ax,[e.G for e in path] ./ 1e9,[e.m for e in path];color=c_acc,markersize=12,
