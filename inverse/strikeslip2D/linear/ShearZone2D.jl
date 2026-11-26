@@ -338,11 +338,11 @@ end
 ## OPTIMIZER --------------------------------------------------------------------------
 
 # G varies, the time step does not (see problem 1 below)
-setup_ref = setup_linear(; plot_every = nothing, verbose = 1, run_adjoint = false)
-setup_G(G) = merge(
-    setup_linear(; G, plot_every = nothing, verbose = 1, run_adjoint = false),
-    (; time = setup_ref.time),
-)
+function setup_G(G, steps_per_tr; G_ref = 55.0e9)
+    s   = setup_linear(; G, steps_per_tr, plot_every = nothing, verbose = 1, run_adjoint = false)
+    ref = setup_linear(; G = G_ref, steps_per_tr, plot_every = nothing, verbose = 1, run_adjoint = false)
+    return merge(s, (; time = ref.time))
+end
 
 # Forward run without adjoint: final Vx and the box mask (true at the 144 observation nodes)
 function forward_Vx(setup, igg)
@@ -367,7 +367,60 @@ function misfit_gradient_G(setup, igg, Vx, Vx_obs, mask)
     return nu_sensitivities(dmdG, dmdKb, s.material.G, s.material.ν).G_ν
 end
 
-function gradient_descent_G(igg; G0, Vx_obs, gd_maxiter = 300, maxls = 10, max_dlnG = 0.5,
+"""
+    frozen_history_misfit(G_base, Gs, igg, Vx_obs)
+
+Misfit with the stress history frozen: steps 1…nt-1 run with `G_base`, only the last step
+with each G in `Gs` (τ_o, P0 of the last step stay at their `G_base` values). The per-step
+adjoint differentiates exactly this function at G = G_base.
+"""
+function frozen_history_misfit(G_base, Gs, igg, Vx_obs)
+    s = setup_G(G_base)
+    configure_output!(s.output)
+    model = build_model(s)
+    (; center, half_width) = s.adjoint
+    box = box_observation(model.stokes.V.Vx, model.grid, center, half_width; antisymmetric = false)
+    mask = Array(box.weights) .!= 0
+    hist = NamedTuple[]
+    for it in 1:(s.time.nt - 1)
+        time_step!(model, igg, it, hist)
+    end
+    return map(Gs) do G
+        sG = setup_G(G)
+        mdl = deepcopy(model)     # converged state after step nt-1; one deepcopy keeps args.P === stokes.P
+        mdl = merge(mdl, (; setup = merge(mdl.setup, (; rheology = sG.rheology, material = sG.material))))
+        time_step!(mdl, igg, s.time.nt, hist)
+        misfit(Array(mdl.stokes.V.Vx), Vx_obs, mask)
+    end
+end
+
+"""
+    frozen_history_curves(result, igg, Vx_obs; halfwidth = 0.1, npoints = 11)
+
+Frozen-history misfit for G ∈ G_base·[1 - halfwidth, 1 + halfwidth] around every accepted
+point of `gradient_descent_G` at which a gradient was computed. Prints the slope of each curve
+at G_base next to the adjoint dm/dG stored for that point.
+"""
+function frozen_history_curves(result, igg, Vx_obs; halfwidth = 0.1, npoints = 11)
+    isodd(npoints) || throw(ArgumentError("npoints must be odd, so that G_base is on the curve"))
+    h = result.history
+    k = (npoints + 1) ÷ 2                               # index of G_base
+    curves = NamedTuple[]
+    for e in h
+        e.accepted || continue
+        j = findfirst(t -> t.gd_iter == e.gd_iter + 1, h)
+        isnothing(j) && continue                        # final point: no gradient computed there
+        Gs = collect(e.G .* range(1 - halfwidth, 1 + halfwidth; length = npoints))
+        ms = frozen_history_misfit(e.G, Gs, igg, Vx_obs)
+        slope = (ms[k + 1] - ms[k - 1]) / (Gs[k + 1] - Gs[k - 1])
+        @printf("frozen τ_o at G = %.4e: m = %.6e (full run %.6e), slope = % .6e, adjoint = % .6e, ratio = %.4f\n",
+                e.G, ms[k], e.m, slope, h[j].dmdG, slope / h[j].dmdG)
+        push!(curves, (; G_base = e.G, Gs, ms))
+    end
+    return curves
+end
+
+function gradient_descent_G(igg; G0, steps_per_tr, Vx_obs, gd_maxiter = 300, maxls = 10, max_dlnG = 0.5,
                             tol_m = 1e-6,   # stop when m/m0 < tol_m (fit good enough)
                             tol_G = 1e-4,   # stop when an accepted step changes G by < 0.01 %
                             rtol  = 1e-3)   # stop when m improves by < 0.1 % (stall)
@@ -376,7 +429,7 @@ function gradient_descent_G(igg; G0, Vx_obs, gd_maxiter = 300, maxls = 10, max_d
     gamma = nothing
 
     @printf("Calc Vx for G = %.3e ...", G)
-    Vx, mask = forward_Vx(setup_G(G), igg)
+    Vx, mask = forward_Vx(setup_G(G, steps_per_tr), igg)
     @printf("... done calculating Vx for G = %.3e \n", G)
 
     @printf("calculating misfit between Vx and Vx_obs ...")
@@ -393,7 +446,7 @@ function gradient_descent_G(igg; G0, Vx_obs, gd_maxiter = 300, maxls = 10, max_d
 
     for i in 1:gd_maxiter
         @printf("i = %d, G = %.3e \n", i, G)
-        dmdG = misfit_gradient_G(setup_G(G), igg, Vx, Vx_obs, mask)
+        dmdG = misfit_gradient_G(setup_G(G, steps_per_tr), igg, Vx, Vx_obs, mask)
         s = G * dmdG / m                                # d ln m / d ln G
         gamma = something(gamma, 0.1 / abs(s))
         @printf("Calculated dmdG: %.3e \n", dmdG)
@@ -405,7 +458,7 @@ function gradient_descent_G(igg; G0, Vx_obs, gd_maxiter = 300, maxls = 10, max_d
             @printf("backtrack iteration %d \n", ls_i)
             dlnG = clamp(-gamma * s, -max_dlnG, max_dlnG)
             G_try = G * exp(dlnG)
-            Vx_try, _ = forward_Vx(setup_G(G_try), igg)
+            Vx_try, _ = forward_Vx(setup_G(G_try, steps_per_tr), igg)
             m_try = misfit(Vx_try, Vx_obs, mask)
             @printf("m_try misfit: %.6e \n", m_try)
 
@@ -475,9 +528,12 @@ if ImplicitGlobalGrid.grid_is_initialized()
 end
 igg = IGG(init_global_grid(setup.domain.nx, setup.domain.ny, 1; init_MPI = !JustRelax.MPI.Initialized())...)
 
-Vx_obs, _ = forward_Vx(setup_G(65.0e9), igg)
+Vx_obs, _ = forward_Vx(setup_G(65.0e9, 1), igg)
 
-result = gradient_descent_G(igg; G0 = 50.0e9, Vx_obs)
+result = gradient_descent_G(igg; G0 = 50.0e9, steps_per_tr = 1, Vx_obs)
+
+# misfit with τ_o frozen around every gradient point: the curve the adjoint tangents belong to
+#frozen = frozen_history_curves(result, igg, Vx_obs)
 
 plot_gradient_descent_G(result; G_true = 65.0e9, figdir = setup.output.figdir)
 plot_gradient_descent_G(result; G_true = 65.0e9, figdir = setup.output.figdir, yscale = log)

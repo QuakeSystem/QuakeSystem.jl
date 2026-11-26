@@ -303,10 +303,13 @@ Misfit-over-G plot of `gradient_descent_G`, built from `result.history`.
 - Solid line + filled markers: the accepted path (start point and every accepted step).
 - Faint dashed segments + hollow markers: rejected backtracking trials, each drawn from the
   accepted point it was tried from.
-`G_true` (optional) adds a vertical line at the synthetic-truth G. If `figdir` is given the
-figure is saved there.
+`G_true` (optional) adds a vertical line at the synthetic-truth G. `frozen` (optional, from
+`frozen_history_curves`) adds the misfit with τ_o frozen around every gradient point: only the
+last time step sees G, which is the function the per-step adjoint differentiates. If `figdir`
+is given the figure is saved there.
 """
-function plot_gradient_descent_G(result; G_true=nothing, figdir=nothing, name="gradient_descent_G", yscale=identity)
+function plot_gradient_descent_G(result; G_true=nothing, figdir=nothing, name="gradient_descent_G", yscale=identity,
+                                 frozen=nothing)
     h = result.history
     # the start point (gd_iter = 0) carries accepted = false but belongs to the accepted path
     is_acc = [e.accepted for e in h]
@@ -336,6 +339,13 @@ function plot_gradient_descent_G(result; G_true=nothing, figdir=nothing, name="g
     lines!(ax,[e.G for e in path] ./ 1e9,[e.m for e in path];color=c_acc,linewidth=2.5)
     scatter!(ax,[e.G for e in path] ./ 1e9,[e.m for e in path];color=c_acc,markersize=12,
              label="accepted")
+    # misfit with τ_o frozen at each gradient point (drawn under the tangents)
+    if !isnothing(frozen)
+        for (k, c) in enumerate(frozen)
+            lines!(ax,c.Gs ./ 1e9,c.ms;color=(:mediumpurple3,0.9),linewidth=2,
+                   label = k == 1 ? "misfit, τ_o frozen (last step only)" : nothing)
+        end
+    end
     # local misfit slope at every accepted point: a short black tangent segment. The gradient at a
     # point is computed when the next iteration starts from it, so it sits in the history entries
     # of iteration gd_iter+1 (the final point has none).
