@@ -52,6 +52,7 @@ include(joinpath(@__DIR__, "localModules", "geometry.jl"))
 include(joinpath(@__DIR__, "localModules", "sensitivities.jl"))
 include(joinpath(@__DIR__, "localModules", "plotting.jl"))
 include(joinpath(@__DIR__, "localModules", "sensitivityAnalysis.jl"))
+include(joinpath(@__DIR__, "localModules", "viscosityField.jl"))
 
 is_step(it, every, nt) = it == nt || (!isnothing(every) && every > 0 && it % every == 0)
 
@@ -344,6 +345,12 @@ function setup_G(G, steps_per_tr; G_ref = 55.0e9)
     return merge(s, (; time = ref.time))
 end
 
+function setup_η(η_matrix, η_weak, steps_per_tr; η_matrix_ref = 1.0e25, η_weak_ref = 1.0e18)
+    s = setup_linear(; η_matrix, η_weak, steps_per_tr, plot_every = nothing, verbose = 1, run_adjoint = false)
+    ref = setup_linear(; η_matrix_ref, η_weak_ref, steps_per_tr, plot_every = nothing, verbose = 1, run_adjoint = false)
+    return merge(s, (; time = ref.time))
+end
+
 # Forward run without adjoint: final Vx and the box mask (true at the 144 observation nodes)
 function forward_Vx(setup, igg)
     configure_output!(setup.output)
@@ -366,6 +373,7 @@ function misfit_gradient_G(setup, igg, Vx, Vx_obs, mask)
     dmdG, dmdKb = (sum(r.dJdp for r in h.totals if r.name === n) for n in (:G, :Kb))
     return nu_sensitivities(dmdG, dmdKb, s.material.G, s.material.ν).G_ν
 end
+
 
 """
     frozen_history_misfit(G_base, Gs, igg, Vx_obs)
@@ -505,6 +513,102 @@ function gradient_descent_G(igg; G0, steps_per_tr, Vx_obs, gd_maxiter = 300, max
     return (; G, misfit = m, status, history = history_opt)
 end
 
+"""
+    gradient_descent_η(igg; η0_matrix, η0_weak, steps_per_tr, Vx_obs, ...)
+
+Gradient descent on ln ηv, one parameter per vertex. The start is the two-phase field of
+(η0_matrix, η0_weak); η on the centres follows from ηv (see localModules/viscosityField.jl).
+Step: dln ηv = -γ · (d ln m / d ln ηv), clamped per vertex to ±max_dlnη, with the same
+backtracking and γ adaptation as `gradient_descent_G`.
+"""
+function gradient_descent_η(igg; η0_matrix, η0_weak, steps_per_tr, Vx_obs,
+                            gd_maxiter = 300, maxls = 10, max_dlnη = 0.5,
+                            tol_m = 1e-6,   # stop when m/m0 < tol_m (fit good enough)
+                            tol_η = 1e-4,   # stop when an accepted step changes every ηv by < 0.01 %
+                            rtol  = 1e-6)   # stop when m improves by < 0.1 % (stall)
+
+    gamma = nothing
+    s_ηv = setup_ηv(steps_per_tr)                       # update_material = false, fixed time step
+
+    ηv = rheology_viscosity(; η_matrix = η0_matrix, η_weak = η0_weak).ηv
+
+    @printf("Calc Vx for η_matrix = %.3e, η_weak = %.3e ...", η0_matrix, η0_weak)
+    Vx, mask = forward_Vx_ηv(s_ηv, igg, ηv)
+    @printf("... done calculating Vx\n")
+
+    @printf("calculating misfit between Vx and Vx_obs ...")
+    m = misfit(Vx, Vx_obs, mask)
+    @printf("... done! The misfit is %.3e \n", m)
+
+    m0 = m
+    history_opt = [(; gd_iter = 0, bt_iter = 0, ηv, m = m0, dmdlnηv = fill(NaN, size(ηv)), accepted = true)]
+    status = :maxiter                                   # records why the loop ended
+
+    println("\nXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX")
+    println("XXXXXXXXXXXX   start gradient descent loop   XXXXXXXXXXXX")
+    println("XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX\n")
+
+    for i in 1:gd_maxiter
+        @printf("i = %d, ηv ∈ [%.3e, %.3e] \n", i, extrema(ηv)...)
+        dmdlnηv = misfit_gradient_lnηv(s_ηv, igg, ηv, Vx, Vx_obs, mask)   # ∂m/∂ln ηv per vertex
+        s = dmdlnηv ./ m                                # d ln m / d ln ηv
+        gamma = something(gamma, 0.1 / maximum(abs, s)) # first step: at most 0.1 in ln ηv
+        @printf("Calculated dm/dln ηv: max |.| = %.3e \n", maximum(abs, dmdlnηv))
+        m_prev = m
+        ηv_prev = ηv
+        accepted = false
+
+        for ls_i in 1:maxls
+            @printf("backtrack iteration %d \n", ls_i)
+            dlnηv = clamp.(-gamma .* s, -max_dlnη, max_dlnη)
+            ηv_try = ηv .* exp.(dlnηv)
+            Vx_try, _ = forward_Vx_ηv(s_ηv, igg, ηv_try)
+            m_try = misfit(Vx_try, Vx_obs, mask)
+            @printf("m_try misfit: %.6e \n", m_try)
+
+            if m_try < m
+                ηv, Vx, m = ηv_try, Vx_try, m_try
+                gamma *= 1.2
+                accepted = true
+                push!(history_opt, (; gd_iter = i, bt_iter = ls_i, ηv = ηv_try, m = m_try, dmdlnηv, accepted))
+                break
+            end
+            push!(history_opt, (; gd_iter = i, bt_iter = ls_i, ηv = ηv_try, m = m_try, dmdlnηv, accepted))
+            gamma *= 0.5
+        end
+
+        if !accepted
+            @printf("Line search failed at iteration %d\n", i)
+            status = :linesearch_failed
+            break
+        end
+
+        dlnηv_acc = maximum(abs, log.(ηv ./ ηv_prev))  # largest change over all vertices
+        @printf("Iteration %3d: misfit = %.4e (m/m0 = %.3e), max |Δ ln ηv| = %.3e\n",
+                i, m, m / m0, dlnηv_acc)
+
+        # stopping criteria. the first one met ends the loop
+        if m / m0 < tol_m
+            @printf("Converged: m/m0 = %.3e < tol_m = %.1e\n", m / m0, tol_m)
+            status = :converged_misfit
+            break
+        elseif dlnηv_acc < tol_η
+            @printf("Converged: ηv changed by at most %.4f %% in the last step (< %.4f %%)\n",
+                    100 * dlnηv_acc, 100 * tol_η)
+            status = :converged_η
+            break
+        elseif abs(m_prev - m) <= rtol * m_prev
+            @printf("Stalled: misfit decreased by only %.3e %% in the last step\n",
+                    100 * (m_prev - m) / m_prev)
+            status = :stalled
+            break
+        end
+    end
+
+    status === :maxiter && @printf("Reached gd_maxiter = %d without meeting a stopping criterion\n", gd_maxiter)
+    return (; ηv, misfit = m, status, history = history_opt)
+end
+
 ## MAIN -------------------------------------------------------------------------------
 function main(setup, igg)
     configure_output!(setup.output)
@@ -528,14 +632,27 @@ if ImplicitGlobalGrid.grid_is_initialized()
 end
 igg = IGG(init_global_grid(setup.domain.nx, setup.domain.ny, 1; init_MPI = !JustRelax.MPI.Initialized())...)
 
-Vx_obs, _ = forward_Vx(setup_G(65.0e9, 1), igg)
+function run_inversion_G()
+    Vx_obs, _ = forward_Vx(setup_G(65.0e9, 1), igg)
 
-result = gradient_descent_G(igg; G0 = 50.0e9, steps_per_tr = 1, Vx_obs)
+    result = gradient_descent_G(igg; G0 = 50.0e9, steps_per_tr = 1, Vx_obs)
 
-# misfit with τ_o frozen around every gradient point: the curve the adjoint tangents belong to
-#frozen = frozen_history_curves(result, igg, Vx_obs)
+    # misfit with τ_o frozen around every gradient point: the curve the adjoint tangents belong to
+    #frozen = frozen_history_curves(result, igg, Vx_obs)
 
-plot_gradient_descent_G(result; G_true = 65.0e9, figdir = setup.output.figdir)
-plot_gradient_descent_G(result; G_true = 65.0e9, figdir = setup.output.figdir, yscale = log)
+    plot_gradient_descent_G(result; G_true = 65.0e9, figdir = setup.output.figdir)
+    plot_gradient_descent_G(result; G_true = 65.0e9, figdir = setup.output.figdir, yscale = log)
+    return nothing
+end
 
-nothing   # to keep `result` quiet / to not print result
+function run_inversion_η()
+    # synthetic data from the two-phase field, run through the same prescribed-ηv path
+    ηv_true = rheology_viscosity(; η_matrix = 1.0e19, η_weak = 1.0e24).ηv
+    Vx_obs, _ = forward_Vx_ηv(setup_ηv(1), igg, ηv_true)
+
+    result = gradient_descent_η(igg; η0_matrix = 1.0e22, η0_weak = 1.0e22, steps_per_tr = 1, Vx_obs)
+    return nothing
+end
+
+run_inversion_η()
+nothing
