@@ -522,7 +522,7 @@ Step: dln ηv = -γ · (d ln m / d ln ηv), clamped per vertex to ±max_dlnη, w
 backtracking and γ adaptation as `gradient_descent_G`.
 """
 function gradient_descent_η(igg; η0_matrix, η0_weak, steps_per_tr, Vx_obs,
-                            gd_maxiter = 300, maxls = 10, max_dlnη = 0.5,
+                            gd_maxiter = 300, maxls = 25, max_dlnη = 0.5,
                             tol_m = 1e-6,   # stop when m/m0 < tol_m (fit good enough)
                             tol_η = 1e-4,   # stop when an accepted step changes every ηv by < 0.01 %
                             rtol  = 1e-6)   # stop when m improves by < 0.1 % (stall)
@@ -540,7 +540,7 @@ function gradient_descent_η(igg; η0_matrix, η0_weak, steps_per_tr, Vx_obs,
     m = misfit(Vx, Vx_obs, mask)
     @printf("... done! The misfit is %.3e \n", m)
 
-    m0 = m
+    m0, Vx0 = m, Vx
     history_opt = [(; gd_iter = 0, bt_iter = 0, ηv, m = m0, dmdlnηv = fill(NaN, size(ηv)), accepted = true)]
     status = :maxiter                                   # records why the loop ended
 
@@ -568,13 +568,13 @@ function gradient_descent_η(igg; η0_matrix, η0_weak, steps_per_tr, Vx_obs,
 
             if m_try < m
                 ηv, Vx, m = ηv_try, Vx_try, m_try
-                gamma *= 1.2
+                gamma *= 1.5
                 accepted = true
                 push!(history_opt, (; gd_iter = i, bt_iter = ls_i, ηv = ηv_try, m = m_try, dmdlnηv, accepted))
                 break
             end
             push!(history_opt, (; gd_iter = i, bt_iter = ls_i, ηv = ηv_try, m = m_try, dmdlnηv, accepted))
-            gamma *= 0.5
+            gamma *= 0.35
         end
 
         if !accepted
@@ -606,7 +606,28 @@ function gradient_descent_η(igg; η0_matrix, η0_weak, steps_per_tr, Vx_obs,
     end
 
     status === :maxiter && @printf("Reached gd_maxiter = %d without meeting a stopping criterion\n", gd_maxiter)
-    return (; ηv, misfit = m, status, history = history_opt)
+    return (; ηv, misfit = m, status, history = history_opt, Vx0, Vx, mask)
+end
+
+"""
+    plot_viscosity_inversion(result, Vx_obs; ηv_true = nothing, setup = setup_ηv(1), frames_every = 1)
+
+All figures of a `gradient_descent_η` run, into `setup.output.figdir`: convergence, ηv maps,
+ηv profiles, the Vx fit and (unless `frames_every = nothing`) one frame per accepted iterate.
+"""
+function plot_viscosity_inversion(result, Vx_obs; ηv_true = nothing, setup = setup_ηv(1), frames_every = 1)
+    grid = viscosity_grid(setup)
+    figdir = setup.output.figdir
+    kw = (; zone_keywords(setup.zone)..., observation_center = setup.adjoint.center,
+          observation_half_width = setup.adjoint.half_width)
+    plot_gradient_descent_η(result; figdir)
+    plot_viscosity_fields(result, grid; ηv_true, figdir, kw...)
+    plot_viscosity_profiles(result, grid; ηv_true, figdir, y_min = kw.y_min, y_max = kw.y_max,
+                            observation_center = kw.observation_center,
+                            observation_half_width = kw.observation_half_width)
+    plot_Vx_fit(result, grid, Vx_obs; figdir, kw...)
+    isnothing(frames_every) || plot_viscosity_frames(result, grid; ηv_true, figdir, every = frames_every, kw...)
+    return nothing
 end
 
 ## MAIN -------------------------------------------------------------------------------
@@ -647,11 +668,12 @@ end
 
 function run_inversion_η()
     # synthetic data from the two-phase field, run through the same prescribed-ηv path
-    ηv_true = rheology_viscosity(; η_matrix = 1.0e19, η_weak = 1.0e24).ηv
+    ηv_true = rheology_viscosity(; η_matrix = 1.0e24, η_weak = 1.0e19).ηv
     Vx_obs, _ = forward_Vx_ηv(setup_ηv(1), igg, ηv_true)
 
     result = gradient_descent_η(igg; η0_matrix = 1.0e22, η0_weak = 1.0e22, steps_per_tr = 1, Vx_obs)
-    return nothing
+    plot_viscosity_inversion(result, Vx_obs; ηv_true)
+    return result
 end
 
 run_inversion_η()

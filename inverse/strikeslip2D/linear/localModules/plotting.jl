@@ -16,7 +16,9 @@ const FRAME_FOLDERS = Dict(
     "sensitivity_contours"=>"dJdp_contour","sensitivity_combined"=>"combined","sensitivity_creep"=>"creep","sensitivity_all"=>"all","sensitivity_all_heatmap"=>"all_heatmap",
     "sensitivity_2x2"=>"2x2","sensitivity_2x2_heatmap"=>"2x2_heatmap","sensitivity_logarithmic"=>"logarithmic",
     "sensitivity_logarithmic_shared"=>"logarithmic_shared","sensitivity_relative"=>"relative",
-    "sensitivity_relative_shared"=>"relative_shared","sensitivity_max_relative"=>"max_relative")
+    "sensitivity_relative_shared"=>"relative_shared","sensitivity_max_relative"=>"max_relative",
+    # viscosity inversion
+    "viscosity_inversion"=>"viscosity_inversion")
 const STEP_SUFFIX = r"_step\d+$"
 
 function frame_dir(figdir,name)
@@ -323,7 +325,7 @@ function plot_gradient_descent_G(result; G_true=nothing, figdir=nothing, name="g
         a ? (last_acc = e) : (k += 1; base[k] = last_acc)
     end
 
-    fig = Figure(size=(1250,650),fontsize=20)
+    fig = Figure(size=(800,650),fontsize=20)
     ax = Axis(fig[1,1];xlabel="G [GPa]",ylabel="misfit",yscale=yscale,
               title="Gradient descent on G ($(length(path)-1) accepted, $(length(trials)) rejected)")
 
@@ -372,7 +374,273 @@ function plot_gradient_descent_G(result; G_true=nothing, figdir=nothing, name="g
 
     isnothing(G_true) || vlines!(ax,G_true/1e9;color=:gray40,linestyle=:dot,linewidth=2,label="G true")
 
-    Legend(fig[1,2],ax;framevisible=false)
+    # compact legend under the axis: small font, 3 columns, row height sized to its content so the
+    # main axis keeps (nearly) all of the figure height
+    Legend(fig[2,1],ax;framevisible=false,labelsize=20,nbanks=3,orientation=:vertical,
+           markersize=10,patchsize=(22,10),rowgap=0,colgap=18,padding=(0,0,0,0),
+           tellheight=true,tellwidth=false)
+    rowsize!(fig.layout,2,Auto(1))
+    rowgap!(fig.layout,6)
     isnothing(figdir) || save_figure(figdir,"$(name)_$(nameof(yscale))",fig)   # e.g. gradient_descent_G_log.png
+    return fig
+end
+
+## Viscosity (ηv) inversion diagnostics ------------------------------------------------
+# All take the named tuple returned by `gradient_descent_η` and the model `grid`
+# (`viscosity_grid(setup)` builds one without a model). ηv lives on the vertices: grid.xvi.
+# Column nx+1 of ηv is the periodic seam (copy of column 1) and is left out of x-averages.
+
+viscosity_grid(setup) = Geometry((setup.domain.nx,setup.domain.ny),(setup.domain.lx,setup.domain.ly);
+                                 origin=setup.domain.origin)
+
+# the start point and every accepted step / the rejected backtracking trials
+ηpath(h)   = [e for e in h if e.accepted || e.gd_iter == 0]
+ηtrials(h) = [e for e in h if !(e.accepted || e.gd_iter == 0)]
+
+# x-average of log10 ηv (geometric mean), seam column excluded, plus the min/max over x
+function ηprofile(ηv)
+    L = log10.(ηv[1:end-1,:])
+    return (; mean=vec(sum(L;dims=1)) ./ size(L,1),lo=vec(minimum(L;dims=1)),hi=vec(maximum(L;dims=1)))
+end
+
+# gradient of iteration i (taken at the accepted point of iteration i-1), as d ln m / d ln ηv
+function ηgradient(h,i)
+    j = findfirst(e -> e.gd_iter == i,h)
+    isnothing(j) && return nothing
+    m_base = ηpath(h)[findlast(e -> e.gd_iter < i,ηpath(h))].m
+    return h[j].dmdlnηv ./ m_base
+end
+
+# iteration axis: integer ticks only (steps of 1, 2, 5, 10, ...)
+const ITER_TICKS = WilkinsonTicks(6;k_min=3,Q=[(1.0,1.0),(5.0,0.9),(2.0,0.7)])
+
+# log axis with the decade ticks defined above
+logaxis(pos;kwargs...) = Axis(pos;yscale=log10,yticks=decade_ticks,ytickformat=decade_labels,kwargs...)
+
+"""
+    plot_gradient_descent_η(result; figdir=nothing, name="gradient_descent_eta")
+
+Convergence of `gradient_descent_η`, against the gradient-descent iteration:
+(a) misfit m/m₀, accepted path and rejected backtracking trials;
+(b) largest accepted change max|Δ ln ηv| and the gradient max|d ln m/d ln ηv|;
+(c) forward runs per iteration (backtracking trials), to judge the γ adaptation.
+"""
+function plot_gradient_descent_η(result;figdir=nothing,name="gradient_descent_eta")
+    h = result.history
+    path,trials = ηpath(h),ηtrials(h)
+    m0 = first(h).m
+    niter = maximum(e.gd_iter for e in h)
+    c_acc,c_rej = :dodgerblue3,:darkorange2
+
+    fig = Figure(size=(1700,560),fontsize=20)
+    Label(fig[0,1:3],"Viscosity inversion: $(length(path)-1) accepted steps, $(length(trials)) rejected trials, " *
+          "status $(get(result,:status,""))";fontsize=22)
+
+    ax1 = logaxis(fig[1,1];xlabel="iteration",xticks=ITER_TICKS,ylabel=L"m/m_0",title="misfit")
+    isempty(trials) || scatter!(ax1,[e.gd_iter for e in trials],[e.m/m0 for e in trials];
+                                color=(c_rej,0.15),strokecolor=(c_rej,0.7),strokewidth=1.5,markersize=10,
+                                label="rejected trial")
+    scatterlines!(ax1,[e.gd_iter for e in path],[e.m/m0 for e in path];color=c_acc,markersize=10,
+                  linewidth=2.5,label="accepted")
+    axislegend(ax1;position=:rt,framevisible=false)
+
+    ax2 = logaxis(fig[1,2];xlabel="iteration",xticks=ITER_TICKS,title="step size and gradient")
+    its  = [e.gd_iter for e in path[2:end]]
+    dlnη = [maximum(abs,log.(path[k+1].ηv ./ path[k].ηv)) for k in 1:length(path)-1]
+    grad = [(i,maximum(abs,g)) for i in 1:niter for g in (ηgradient(h,i),) if !isnothing(g)]
+    isempty(dlnη) || scatterlines!(ax2,its,dlnη;color=c_acc,markersize=10,linewidth=2,
+                                   label=L"\max\,|\Delta \ln \eta_v|\ \mathrm{(accepted)}")
+    scatterlines!(ax2,first.(grad),last.(grad);color=:black,marker=:utriangle,markersize=10,linewidth=2,
+                  label=L"\max\,|\partial \ln m/\partial \ln \eta_v|")
+    axislegend(ax2;position=:rt,framevisible=false)
+
+    ax3 = Axis(fig[1,3];xlabel="iteration",ylabel="forward runs",title="line-search trials per iteration",
+               xticks=ITER_TICKS,yticks=WilkinsonTicks(5;k_min=3))
+    counts = [count(e -> e.gd_iter == i,h) for i in 1:niter]
+    ok     = [any(e -> e.gd_iter == i && e.accepted,h) for i in 1:niter]
+    barplot!(ax3,1:niter,counts;color=[a ? c_acc : :firebrick for a in ok],strokewidth=0)
+    ylims!(ax3,0,nothing)
+
+    colgap!(fig.layout,30)
+    isnothing(figdir) || save_figure(figdir,name,fig)
+    return fig
+end
+
+# map at fig[row,2col-1], colorbar at fig[row,2col] (`fig` may also be a GridLayout), shear zone and observation box drawn
+function ηmap!(fig,row,col,xv,yv,A;title,colormap=:batlow,colorrange=crange(A),cbar_label="",
+               x_min,x_max,y_min,y_max,observation_center,observation_half_width)
+    ax = Axis(fig[row,2col-1];aspect=DataAspect(),title=title,xlabel="x [m]",ylabel=col==1 ? "y [m]" : "",
+              titlesize=22,xgridvisible=false,ygridvisible=false)
+    hm = heatmap!(ax,xv,yv,A;colormap=colormap,colorrange=colorrange)
+    Colorbar(fig[row,2col],hm;width=18,ticklabelsize=15,label=cbar_label)
+    add_shear_zone!(ax,x_min,x_max,y_min,y_max)
+    add_observation_box!(ax,observation_center,observation_half_width)
+    limits!(ax,first(xv),last(xv),first(yv),last(yv))
+    col > 1 && hideydecorations!(ax;ticks=false,ticklabels=false)
+    return ax
+end
+
+"""
+    plot_viscosity_fields(result, grid; ηv_true=nothing, figdir=nothing, zone/box keywords...)
+
+Maps of the ηv inversion. Row 1: log10 ηv of the start, the result and (given `ηv_true`) the
+truth, on one colour scale. Row 2: log10(ηv/ηv_true) (the error; without `ηv_true` the change
+log10(ηv/ηv₀)), the change from the start, and the last gradient d ln m/d ln ηv.
+"""
+function plot_viscosity_fields(result,grid;ηv_true=nothing,figdir=nothing,name="viscosity_inversion_fields",
+                               x_min=-500.0,x_max=500.0,y_min=-50.0,y_max=50.0,
+                               observation_center=(0.0,0.0),observation_half_width=(100.0,100.0))
+    h = result.history
+    xv,yv = collect.(grid.xvi)
+    L0,L1 = log10.(first(h).ηv),log10.(result.ηv)
+    Lt = isnothing(ηv_true) ? nothing : log10.(ηv_true)
+    lims = crange(vcat(vec(L0),vec(L1),isnothing(Lt) ? Float64[] : vec(Lt)))
+    kw = (; x_min,x_max,y_min,y_max,observation_center,observation_half_width)
+    unit = L"\log_{10}\,\eta_v\ \mathrm{[Pa\,s]}"
+
+    fig = Figure(size=(1800,1150),fontsize=20)
+    Label(fig[0,1:6],@sprintf("Viscosity inversion — m/m₀ = %.3e after %d iterations (%s)",
+                              result.misfit/first(h).m,maximum(e.gd_iter for e in h),get(result,:status,""));
+          fontsize=24)
+    ηmap!(fig,1,1,xv,yv,L0;title=L"\mathrm{start}\ \eta_v^{0}",colorrange=lims,cbar_label=unit,kw...)
+    ηmap!(fig,1,2,xv,yv,L1;title=L"\mathrm{result}\ \eta_v",colorrange=lims,cbar_label=unit,kw...)
+    isnothing(Lt) || ηmap!(fig,1,3,xv,yv,Lt;title=L"\mathrm{true}\ \eta_v^{\mathrm{true}}",colorrange=lims,
+                           cbar_label=unit,kw...)
+
+    if !isnothing(Lt)
+        E = L1 .- Lt
+        ηmap!(fig,2,1,xv,yv,E;title=L"\mathrm{error}\ \log_{10}(\eta_v/\eta_v^{\mathrm{true}})",
+              colormap=:vik,colorrange=crange(E;diverging=true),kw...)
+    end
+    D = L1 .- L0
+    ηmap!(fig,2,2,xv,yv,D;title=L"\mathrm{change}\ \log_{10}(\eta_v/\eta_v^{0})",
+          colormap=:vik,colorrange=crange(D;diverging=true),kw...)
+    i_last = maximum(e.gd_iter for e in h)
+    g = i_last > 0 ? ηgradient(h,i_last) : nothing
+    isnothing(g) || ηmap!(fig,2,3,xv,yv,g;title=latexstring("\\partial \\ln m/\\partial \\ln \\eta_v\\ \\mathrm{(iteration\\ $i_last)}"),
+                          colormap=:balance,colorrange=crange(g;diverging=true),kw...)
+
+    colgap!(fig.layout,15)
+    isnothing(figdir) || save_figure(figdir,name,fig)
+    return fig
+end
+
+# shaded weak zone and dashed observation-box limits on a profile axis (y vertical)
+function add_profile_bands!(ax,y_min,y_max,observation_center,observation_half_width)
+    hspan!(ax,y_min,y_max;color=(:gray,0.15))
+    isnothing(observation_center) ||
+        hlines!(ax,observation_center[2] .+ [-1,1] .* observation_half_width[2];color=:magenta,linestyle=:dash,linewidth=1.5)
+    return nothing
+end
+
+"""
+    plot_viscosity_profiles(result, grid; ηv_true=nothing, figdir=nothing, ...)
+
+x-averaged log10 ηv against y for every accepted iterate (coloured by iteration), with the
+start, the truth and the result's min/max over x. Grey band: weak zone; dashed: observation box.
+"""
+function plot_viscosity_profiles(result,grid;ηv_true=nothing,figdir=nothing,name="viscosity_inversion_profiles",
+                                 y_min=-50.0,y_max=50.0,
+                                 observation_center=(0.0,0.0),observation_half_width=(100.0,100.0),
+                                 colormap=:viridis)
+    path = ηpath(result.history)
+    yv = collect(grid.xvi[2])
+    its = [e.gd_iter for e in path]
+    crng = (0,max(maximum(its),1))
+
+    fig = Figure(size=(800,900),fontsize=20)
+    ax = Axis(fig[1,1];xlabel=L"\log_{10}\,\eta_v\ \mathrm{[Pa\,s]}\ \ (x\mathrm{-average})",ylabel="y [m]",
+              title="ηv profiles during the inversion")
+    add_profile_bands!(ax,y_min,y_max,observation_center,observation_half_width)
+    for e in path[2:end-1]
+        lines!(ax,ηprofile(e.ηv).mean,yv;color=e.gd_iter,colormap=colormap,colorrange=crng,linewidth=1.2)
+    end
+    p0,p1 = ηprofile(first(path).ηv),ηprofile(result.ηv)
+    lines!(ax,p0.mean,yv;color=:black,linestyle=:dash,linewidth=2.5,label="start")
+    isnothing(ηv_true) || lines!(ax,ηprofile(ηv_true).mean,yv;color=(:gray30,0.8),linewidth=6,label="true")
+    lines!(ax,p1.mean,yv;color=:red,linewidth=3,label="result")
+    lines!(ax,p1.lo,yv;color=:red,linestyle=:dot,linewidth=1.5,label="result min/max over x")
+    lines!(ax,p1.hi,yv;color=:red,linestyle=:dot,linewidth=1.5)
+    ylims!(ax,first(yv),last(yv))
+    Colorbar(fig[1,2];colormap=colormap,limits=crng,label="iteration")
+    axislegend(ax;position=:rb,framevisible=false,labelsize=17)
+    isnothing(figdir) || save_figure(figdir,name,fig)
+    return fig
+end
+
+"""
+    plot_viscosity_frames(result, grid; ηv_true=nothing, figdir, every=1, ...)
+
+One frame per `every`-th accepted iterate (and the last): log10 ηv map next to its x-averaged
+profile, on fixed axes, for an animation. Saved as viscosity_inversion_stepNNNN.png in
+`figdir/viscosity_inversion/` (NNNN = gradient-descent iteration).
+"""
+function plot_viscosity_frames(result,grid;ηv_true=nothing,figdir,every=1,
+                               x_min=-500.0,x_max=500.0,y_min=-50.0,y_max=50.0,
+                               observation_center=(0.0,0.0),observation_half_width=(100.0,100.0))
+    path = ηpath(result.history)
+    xv,yv = collect.(grid.xvi)
+    m0 = first(path).m
+    Ls = [log10.(e.ηv) for e in path]
+    isnothing(ηv_true) || push!(Ls,log10.(ηv_true))
+    lims = crange(reduce(vcat,vec.(Ls)))
+    kw = (; x_min,x_max,y_min,y_max,observation_center,observation_half_width)
+    p0 = ηprofile(first(path).ηv).mean
+    pt = isnothing(ηv_true) ? nothing : ηprofile(ηv_true).mean
+
+    for (k,e) in enumerate(path)
+        (k == length(path) || (k-1) % every == 0) || continue
+        fig = Figure(size=(1400,700),fontsize=20)
+        Label(fig[0,1:2],@sprintf("iteration %d — m/m₀ = %.3e",e.gd_iter,e.m/m0);fontsize=24)
+        map_layout = fig[1,1] = GridLayout()
+        ηmap!(map_layout,1,1,xv,yv,log10.(e.ηv);title=L"\log_{10}\,\eta_v",colorrange=lims,
+              cbar_label=L"\mathrm{[Pa\,s]}",kw...)
+        ax = Axis(fig[1,2];xlabel=L"\log_{10}\,\eta_v\ (x\mathrm{-average})",ylabel="",title="profile")
+        add_profile_bands!(ax,y_min,y_max,observation_center,observation_half_width)
+        lines!(ax,p0,yv;color=:black,linestyle=:dash,linewidth=2,label="start")
+        isnothing(pt) || lines!(ax,pt,yv;color=(:gray30,0.8),linewidth=6,label="true")
+        lines!(ax,ηprofile(e.ηv).mean,yv;color=:red,linewidth=3,label="current")
+        limits!(ax,lims...,first(yv),last(yv))
+        axislegend(ax;position=:rb,framevisible=false,labelsize=16)
+        colsize!(fig.layout,2,Relative(0.33))
+        save_figure(figdir,"viscosity_inversion"*step_tag(e.gd_iter),fig)
+    end
+    return nothing
+end
+
+"""
+    plot_Vx_fit(result, grid, Vx_obs; figdir=nothing, ...)
+
+Data fit of the ηv inversion, from `result.Vx0`, `result.Vx` and `result.mask`.
+(a) x-averaged Vx against y: data, start and result, observed y range dashed;
+(b, c) Vx - Vx_obs of the start and the result, observation box dashed. Vx in cm/yr.
+"""
+function plot_Vx_fit(result,grid,Vx_obs;figdir=nothing,name="viscosity_inversion_Vx_fit",
+                     x_min=-500.0,x_max=500.0,y_min=-50.0,y_max=50.0,
+                     observation_center=(0.0,0.0),observation_half_width=(100.0,100.0))
+    xs,ys = collect.(grid.xi_vel[1])
+    cm(V) = Array(V) .* MS_TO_CMYR
+    Vobs,V0,V1 = cm(Vx_obs),cm(result.Vx0),cm(result.Vx)
+    xavg(V) = vec(sum(V[1:end-1,:];dims=1)) ./ (size(V,1)-1)     # seam column excluded
+    kw = (; x_min,x_max,y_min,y_max,observation_center,observation_half_width)
+
+    fig = Figure(size=(1800,650),fontsize=20)
+    ax = Axis(fig[1,1];xlabel=L"V_x\ \mathrm{[cm/yr]}\ \ (x\mathrm{-average})",ylabel="y [m]",title="velocity profile")
+    add_profile_bands!(ax,y_min,y_max,observation_center,observation_half_width)
+    lines!(ax,xavg(Vobs),ys;color=(:gray30,0.8),linewidth=6,label="data")
+    lines!(ax,xavg(V0),ys;color=:black,linestyle=:dash,linewidth=2,label="start")
+    lines!(ax,xavg(V1),ys;color=:red,linewidth=2.5,label="result")
+    ylims!(ax,first(ys),last(ys))
+    axislegend(ax;position=:rb,framevisible=false,labelsize=17)
+
+    R0,R1 = V0 .- Vobs,V1 .- Vobs
+    lab = L"\mathrm{[cm/yr]}"
+    maps = fig[1,2] = GridLayout()
+    ηmap!(maps,1,1,xs,ys,R0;title=L"\mathrm{start}\ V_x - V_x^{\mathrm{obs}}",colormap=:vik,
+          colorrange=crange(R0;diverging=true),cbar_label=lab,kw...)
+    ηmap!(maps,1,2,xs,ys,R1;title=L"\mathrm{result}\ V_x - V_x^{\mathrm{obs}}",colormap=:vik,
+          colorrange=crange(R1;diverging=true),cbar_label=lab,kw...)
+    colsize!(fig.layout,1,Relative(0.22))
+    isnothing(figdir) || save_figure(figdir,name,fig)
     return fig
 end
